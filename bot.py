@@ -1,10 +1,14 @@
-"""Telegram-бот: голосовое / аудио / видео -> транскрипт -> выжимка через OpenAI."""
+"""Telegram-бот: голосовое / аудио / видео -> транскрипт -> выжимка через Gemini CLI (подписка Google)."""
 
 import asyncio
+import json
 import logging
 import os
+import shutil
+import tempfile
 import uuid
 from collections import OrderedDict
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -16,25 +20,27 @@ from aiogram.types import (
     Message,
 )
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
 
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
-SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "gpt-4o-mini")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "")
 ALLOWED_USERS = {int(x) for x in os.getenv("ALLOWED_USERS", "").replace(" ", "").split(",") if x}
 
 MAX_FILE_SIZE = 20 * 1024 * 1024  # лимит Telegram Bot API на скачивание файлов
 MAX_STORED = 500  # сколько последних транскриптов держим в памяти
+GEMINI_TIMEOUT = 600
 TG_LIMIT = 4000
-AUDIO_EXT = {"flac", "m4a", "mp3", "mp4", "mpeg", "mpga", "oga", "ogg", "wav", "webm"}
+AUDIO_EXT = {"aac", "aiff", "flac", "m4a", "mov", "mp3", "mp4", "mpeg", "oga", "ogg", "wav", "webm"}
 
+TRANSCRIBE_PROMPT = (
+    "Расшифруй дословно речь из файла @{name}. Выведи только текст расшифровки на языке оригинала, "
+    "без вступлений, комментариев и таймкодов. Если речи нет, выведи ровно: NO_SPEECH"
+)
 SYSTEM_PROMPT = (
-    "Ты помогаешь быстро понять, о чём аудиозапись. Тебе дают её транскрипт. "
+    "Ты помогаешь быстро понять, о чём аудиозапись. Ниже (во входных данных) её транскрипт. "
     "Отвечай на языке транскрипта. Пиши простым текстом без Markdown-разметки "
-    "(не используй *, #, _), списки оформляй символом «• »."
+    "(не используй *, #, _), списки оформляй символом «• ». Задание: "
 )
 FORMATS = {
     "short": ("📝 Коротко", "Сделай очень краткую выжимку: 2–3 предложения, только суть."),
@@ -43,13 +49,60 @@ FORMATS = {
     "todo": ("✅ Задачи", "Выпиши договорённости, задачи, сроки и ответственных, если они упоминаются. Если ничего такого нет — так и скажи одной фразой."),
 }
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+def gemini_command() -> list[str]:
+    exe = shutil.which("gemini")
+    if not exe:
+        raise SystemExit("Не найден Gemini CLI: npm install -g @google/gemini-cli, затем один раз запусти `gemini` и войди в Google.")
+    if os.name == "nt":  # на Windows .cmd/.ps1-обёртки ломают аргументы, запускаем бандл напрямую через node
+        return [shutil.which("node"), str(Path(exe).parent / "node_modules/@google/gemini-cli/bundle/gemini.js")]
+    return [exe]
+
+
+GEMINI = gemini_command()
+gemini_slots = asyncio.Semaphore(2)  # не больше двух процессов Gemini одновременно
 dp = Dispatcher()
 transcripts: OrderedDict[str, str] = OrderedDict()
 
 if ALLOWED_USERS:
     dp.message.filter(F.from_user.id.in_(ALLOWED_USERS))
     dp.callback_query.filter(F.from_user.id.in_(ALLOWED_USERS))
+
+
+async def run_gemini(prompt: str, cwd: str, stdin: str = "") -> str:
+    # plan = режим только для чтения: модель не сможет запускать команды или менять файлы на компьютере
+    args = [*GEMINI, "--skip-trust", "--approval-mode", "plan", "-o", "json", "-p", prompt]
+    if GEMINI_MODEL:
+        args += ["-m", GEMINI_MODEL]
+    async with gemini_slots:
+        proc = await asyncio.create_subprocess_exec(
+            *args, cwd=cwd,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(stdin.encode("utf-8")), GEMINI_TIMEOUT)
+        except TimeoutError:
+            proc.kill()
+            raise RuntimeError("Gemini не ответил за 10 минут")
+    try:
+        data = json.loads(out.decode("utf-8"))
+    except ValueError:
+        raise RuntimeError((err or out).decode("utf-8", "replace").strip()[-500:] or f"Gemini завершился с кодом {proc.returncode}")
+    if "error" in data:
+        raise RuntimeError(data["error"].get("message", data["error"]))
+    return (data.get("response") or "").strip()
+
+
+async def transcribe(data: bytes, name: str) -> str:
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, name).write_bytes(data)
+        text = await run_gemini(TRANSCRIBE_PROMPT.format(name=name), cwd=tmp)
+    return "" if text == "NO_SPEECH" else text
+
+
+async def summarize(text: str, fmt: str) -> str:
+    with tempfile.TemporaryDirectory() as tmp:
+        return await run_gemini(SYSTEM_PROMPT + FORMATS[fmt][1], cwd=tmp, stdin=text)
 
 
 def remember(text: str) -> str:
@@ -67,7 +120,7 @@ def keyboard(key: str) -> InlineKeyboardMarkup:
 
 
 def pick_media(message: Message):
-    """Возвращает (файл, имя для OpenAI) или (файл, None), если формат не поддерживается."""
+    """Возвращает (файл, имя для Gemini) или (файл, None), если формат не поддерживается."""
     if message.voice:
         return message.voice, "voice.ogg"
     if message.video_note:
@@ -75,18 +128,7 @@ def pick_media(message: Message):
     media = message.audio or message.video or message.document
     name = getattr(media, "file_name", None) or ("video.mp4" if message.video else "audio.mp3")
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-    return media, (name if ext in AUDIO_EXT else None)
-
-
-async def summarize(text: str, fmt: str) -> str:
-    response = await client.chat.completions.create(
-        model=SUMMARY_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"{FORMATS[fmt][1]}\n\nТранскрипт:\n{text}"},
-        ],
-    )
-    return response.choices[0].message.content.strip()
+    return media, (f"media.{ext}" if ext in AUDIO_EXT else None)
 
 
 async def send_long(message: Message, text: str) -> None:
@@ -115,8 +157,7 @@ async def on_media(message: Message, bot: Bot) -> None:
     status = await message.reply("⏳ Слушаю…")
     try:
         data = await bot.download(media)
-        result = await client.audio.transcriptions.create(model=TRANSCRIBE_MODEL, file=(name, data.read()))
-        text = result.text.strip()
+        text = await transcribe(data.read(), name)
         if not text:
             await status.edit_text("🤷 Не удалось разобрать речь в этой записи.")
             return
